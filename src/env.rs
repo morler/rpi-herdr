@@ -12,7 +12,7 @@
 //! `HERDR_SOCKET_PATH` is deliberately ignored: v1 talks to the CLI, which the
 //! protocol documents as the portable path (Windows included).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Agent label Herdr shows in its sidebar and `herdr agent list`.
 pub const DEFAULT_AGENT_LABEL: &str = "rpi";
@@ -45,7 +45,7 @@ pub fn detect() -> Option<HerdrEnv> {
 /// `is_file` checks that the Herdr binary still exists.
 pub fn detect_with(
     get: impl Fn(&str) -> Option<String>,
-    is_file: impl Fn(&PathBuf) -> bool,
+    is_file: impl Fn(&Path) -> bool,
 ) -> Option<HerdrEnv> {
     if get("HERDR_ENV").as_deref() != Some("1") {
         return None;
@@ -57,7 +57,11 @@ pub fn detect_with(
     let pane_id = non_empty(get("HERDR_PANE_ID"))?;
     let bin_path = PathBuf::from(non_empty(get("HERDR_BIN_PATH"))?);
     // A stale path (Herdr upgraded mid-run) would otherwise make every turn
-    // spawn a process just to fail; require the file up front.
+    // spawn a process just to fail; require the file up front. This only proves
+    // the path is a regular file — an existing but non-executable binary still
+    // passes and fails at spawn time, which the reporter treats as a dropped
+    // report. Probing the exec bit is not portable (Windows has none), so the
+    // check stays deliberately shallow.
     if !is_file(&bin_path) {
         return None;
     }
@@ -73,11 +77,17 @@ pub fn detect_with(
     })
 }
 
+/// Canonicalise an environment value: surrounding whitespace is dropped, and a
+/// value that was only whitespace counts as unset. Forwarding the raw value
+/// would leak padding into `--agent` / `--pane` and mismatch Herdr's own ids.
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.trim().is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
-/// `RPI_HERDR=0|false|off` (case-insensitive) disables the integration.
+/// `RPI_HERDR=0|false|off|no|disabled` (case-insensitive) disables the
+/// integration.
 fn is_disabled(value: Option<&str>) -> bool {
     is_off(value)
 }
@@ -109,11 +119,11 @@ mod tests {
         }
     }
 
-    fn present(_: &PathBuf) -> bool {
+    fn present(_: &Path) -> bool {
         true
     }
 
-    fn absent(_: &PathBuf) -> bool {
+    fn absent(_: &Path) -> bool {
         false
     }
 
@@ -216,6 +226,21 @@ mod tests {
         let env = detect_with(get, present).expect("complete environment");
         assert_eq!(env.agent_label, "rpi-nightly");
         assert!(!env.resume_enabled, "RPI_HERDR_RESUME=0 keeps state only");
+    }
+
+    #[test]
+    fn padding_is_stripped_from_every_exported_value() {
+        // Herdr's pane id and agent label are matched verbatim, so a padded
+        // variable must not reach the CLI.
+        let get = env_of(&[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "  w18:p1 "),
+            ("HERDR_BIN_PATH", "/usr/bin/herdr"),
+            ("RPI_HERDR_AGENT", " rpi \t"),
+        ]);
+        let env = detect_with(get, present).expect("complete environment");
+        assert_eq!(env.pane_id, "w18:p1");
+        assert_eq!(env.agent_label, "rpi");
     }
 
     #[test]

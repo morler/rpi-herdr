@@ -62,6 +62,9 @@ Herdr 可能把"一轮跑完的空闲"显示成 `done` 之类的展示态；上�
 
 `0` / `false` / `off` / `no` / `disabled` 都算关闭（大小写不敏感）。
 
+三个 `HERDR_*` 变量与 `RPI_HERDR_AGENT` 的环境值都会先 `trim()`：Herdr 的窗格 id
+与标签按字面匹配，带首尾空格的值不能原样透传。
+
 ## 恢复命令（resume）
 
 会话变化时会附带
@@ -72,15 +75,17 @@ rpi --session-id <id> [--provider <p> --model <m> --thinking <l>]
 
 Herdr 用它在服务器重启后于同一个目录重开窗格。构造规则与限制：
 
-- `argv[0]` 必须是 `PATH` 上的普通命令名；不能是路径（Herdr 会回
+- `argv[0]` 必须是 `PATH` 上的普通命令名；不能是路径，也不能带空格（Herdr 会回
   `invalid_resume_argv`）。
 - 参数不得含单引号或控制字符；最多 64 个参数、总计 ≤ 8 KiB。
 - 以 **argv 数组**通过 `--` 传递。把整条命令拼成一个字符串会被 Herdr 拒绝
   （已实测）。
-- 会话 id 来自 `BeforeAgentStart` 的 `sessionId`，回退 `RPI_SESSION_ID`。
-  `--no-session` 的 `ephemeral` 哨兵不视为可恢复会话。
-- 模型/供应商/思考级别来自宿主的 `GetExecutionContext`；任一不合法就整组省掉，
-  只留 `--session-id`。会话恢复的正确性只依赖会话 id。
+- 会话 id 来自 `BeforeAgentStart` 的 `sessionId`，回退 `RPI_SESSION_ID`，再回退
+  `GetExecutionContext`。`--no-session` 的 `ephemeral` 哨兵不视为可恢复会话；若某个
+  候选 id 不安全（含引号/控制字符）会自动降级到下一个候选，而不是丢掉整个命令。
+- 模型/供应商/思考级别来自宿主的 `GetExecutionContext`，并在**每一轮开始**重新读取。
+  单个值不合法只跳过该项，其余保留；若整组仍超限则退回只含 `--session-id` 的最小命令。
+  会话恢复的正确性只依赖会话 id。
 - 不使用 `--session` / `-c` / `--resume`：它们语义模糊，可能恢复错会话。
 
 **已知限制**：`--session-dir` 不平移。插件拿不到该 flag 的值（宿主的 `GetCliFlag`
@@ -93,12 +98,16 @@ Herdr 用它在服务器重启后于同一个目录重开窗格。构造规则�
 
 - 事件处理器只把最新请求写进**单槽覆盖式邮箱**然后返回（实测每个 tag 的
   `duration_ms` 都是 `0`）。处理器里不 spawn 进程、不 sleep、不持锁做 I/O。
+  唯一例外是 `-p`/`--mode json` 一次性运行结束时，为了让最终 `idle` 与释放真正
+  发出去而做的一次有界排空（每进程一次）。
 - 只有一个后台线程执行 `herdr`；一次上报还在路上时积累的多个变化只会保留最后一个。
 - 每次调用有 2 秒上限，超时即 `kill`；spawn 失败、非零退出、超时一律忽略。
 - 三个标准流全部重定向到 null（TUI 独占 tty，且 `herdr` 会往 stdout 写 JSON）。
 - `--seq` 用毫秒时间戳并保证单调递增：普通计数器在 `/reload` 后归零会被 Herdr 丢弃。
 - `finish_shutdown` 只有在后台线程确实结束后才返回 `0`；否则返回 `-1`，让宿主保留
-  本库而不是卸载正在执行的代码。
+  本库而不是卸载正在执行的代码。一次失败的 join 是粘性的：后续调用继续返回 `-1`。
+- 宿主若没有 lifecycle 钩子，插件拒绝启动（返回非零）：没有 `finish_shutdown` 就没有
+  任何东西会 join 上报线程，让宿主卸载它等于在跑代码时开枪打自己。
 
 ## 验证
 

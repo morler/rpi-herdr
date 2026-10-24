@@ -6,8 +6,20 @@ rust-version = "1.78"
 license = "MIT"
 description = "Reports rpi agent state, session resume command and pane release to Herdr."
 readme = "README.md"
+# Provenance for registries and downstream consumers (`cargo publish` warns
+# without it). The plugin is distributed as a prebuilt cdylib, so the crate is
+# the single source of truth for that binary.
+repository = "https://github.com/pi-rust/rpi-package"
+homepage = "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-herdr"
+documentation = "https://docs.rs/rpi-herdr"
 keywords = ["rpi", "herdr", "extension", "agent"]
 categories = ["development-tools"]
+# `cargo package` would otherwise fall back to every VCS-tracked file, dragging
+# `docs/` (internal design notes with SDK line references) into the published
+# crate. Ship only what the cdylib needs. `Cargo.lock` is intentionally present:
+# a shipped plugin binary must be reproducible, and `rpi-plugin-sdk = "0.8"` is a
+# caret requirement that would otherwise float across patch releases.
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [lib]
 # cdylib for the host loader; rlib so `cargo test` can link the modules.
@@ -15,8 +27,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rpi-plugin-sdk = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]
 lto = "thin"
-strip = "symbols"
+# Keep symbol names: the artifact is loaded into the host process, and a panic or
+# crash inside the plugin is otherwise impossible to read. This still drops the
+# DWARF payload that `strip = "symbols"` was really after.
+strip = "debuginfo"

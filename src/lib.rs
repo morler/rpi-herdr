@@ -22,8 +22,11 @@
 //! | `UiPromptEnd` | `PromptDismissed` | `working` |
 //! | `SessionShutdown` | — | release |
 //!
-//! Handlers never do I/O: they overwrite a one-slot mailbox and return, and a
-//! single background thread performs the `herdr` call with a short deadline.
+//! Handlers never spawn a process and never touch the network: they overwrite a
+//! one-slot mailbox and return, and a single background thread performs the
+//! `herdr` call with a short deadline. The one exception is the drain before a
+//! final `idle`+release on the one-shot path, which is bounded and happens once
+//! per process.
 //!
 //! ## Configuration
 //!
@@ -49,7 +52,9 @@ use rpi_plugin_sdk::{
     EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef, EVENT_HANDLER_CONTINUE,
 };
 
-use crate::reporter::{ContextSource, ProcessRunner, Reporter, SHUTDOWN_FLUSH_TIMEOUT};
+use crate::reporter::{
+    ContextSource, ProcessRunner, Reporter, REPORT_FLUSH_TIMEOUT, SHUTDOWN_FLUSH_TIMEOUT,
+};
 use crate::resume::ExecContext;
 use crate::state::Input;
 
@@ -96,8 +101,11 @@ impl ContextSource for HostContext {
         );
         // SAFETY: `out` is either untouched (empty → no-op) or a live
         // allocation produced by the host, which is exactly what the host's
-        // `free_string` reclaims. Freed exactly once, and never read afterwards.
-        let text = unsafe { out.to_string_lossy() };
+        // `free_string` reclaims. The text is copied into an owned `String`
+        // *before* the allocation is released, so nothing below can read freed
+        // host memory regardless of how `to_string_lossy` is implemented. Freed
+        // exactly once, and `free_with` itself no-ops on an empty string.
+        let text: String = unsafe { out.to_string_lossy() };
         unsafe { out.free_with(Some(self.free_string)) };
 
         if rc != 0 || text.is_empty() {
@@ -137,17 +145,22 @@ rpi_plugin_sdk::event_handler! {
             EventTag::SessionStart => reporter.submit(Input::SessionReady, None),
             EventTag::BeforeAgentStart => {
                 // `{"prompt","imageCount","systemPrompt","sessionId","host"}`.
-                // Only `sessionId` matters here; a parse failure just means the
-                // resume command has no id to pin.
+                // Only `sessionId` matters here. Deserialise into a two-field
+                // struct instead of a full `serde_json::Value`: the payload
+                // carries the prompt and the whole system prompt (hundreds of
+                // KB), and every turn would otherwise allocate all of it just
+                // to read one id. Unknown fields are skipped without allocation.
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct BeforeAgentStart {
+                    #[serde(default)]
+                    session_id: Option<String>,
+                }
                 let session_id = event
                     .data_text()
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                    .and_then(|value| {
-                        value
-                            .get("sessionId")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    });
+                    .and_then(|text| serde_json::from_str::<BeforeAgentStart>(&text).ok())
+                    .and_then(|payload| payload.session_id)
+                    .filter(|id| !id.trim().is_empty());
                 reporter.submit(Input::PromptStarted, session_id);
             }
             EventTag::AgentStart => reporter.submit(Input::RunStarted, None),
@@ -161,7 +174,9 @@ rpi_plugin_sdk::event_handler! {
                     // Let the `idle` report land first: publishing the release
                     // into the same slot would overwrite it, and the final
                     // state is what a user watching the sidebar expects to see.
-                    reporter.flush(SHUTDOWN_FLUSH_TIMEOUT);
+                    // The intermediate drain is short by design; the long budget
+                    // is reserved for the release below.
+                    reporter.flush(REPORT_FLUSH_TIMEOUT);
                     reporter.submit_release();
                     reporter.flush(SHUTDOWN_FLUSH_TIMEOUT);
                 }
@@ -256,6 +271,17 @@ rpi_plugin_sdk::export_plugin!(|api: &PluginApi| {
     let Some(register_event_handler) = api.register_event_handler else {
         return 1; // host too old for the ABI surface this plugin needs
     };
+    // The reporter owns a background thread that executes plugin code, so a
+    // lifecycle hook is not optional: without `finish_shutdown` nothing ever
+    // joins that thread and the host may unmap it mid-run. Registering it before
+    // the thread exists means a failure here cannot strand a live worker.
+    let Some(register_lifecycle) = api.register_plugin_lifecycle else {
+        return 1;
+    };
+    let rc = register_lifecycle(begin_shutdown, finish_shutdown, std::ptr::null_mut());
+    if rc != 0 {
+        return rc;
+    }
 
     let context: Arc<dyn ContextSource> = if api.user_data.is_null() {
         Arc::new(NoHost)
@@ -270,28 +296,30 @@ rpi_plugin_sdk::export_plugin!(|api: &PluginApi| {
     let runner = Arc::new(ProcessRunner::new(env.bin_path.clone()));
     let reporter = Reporter::start(env, runner, context);
 
+    // Publish the reporter *before* the handlers exist. The lifecycle hook is
+    // already registered, so every later failure path leaves the host with a
+    // way to join this thread: `finish_shutdown` reads `STATE` and returns -1
+    // when it cannot, which is what keeps a half-registered plugin from being
+    // unmapped while its worker runs.
+    match STATE.lock() {
+        Ok(mut guard) => *guard = Some(Arc::clone(&reporter)),
+        Err(_) => {
+            // Poisoned before we could publish: nobody else can reach the
+            // reporter, so shutting it down here is the only option.
+            if !reporter.shutdown() {
+                eprintln!("rpi-herdr: worker still running after a poisoned state lock");
+            }
+            return 1;
+        }
+    }
+
     for tag in TAGS {
+        // Abandon a partially registered plugin: reporting while some
+        // transitions are missing would show Herdr a state that never happened.
+        // The reporter stays in `STATE` so the lifecycle hook can still join it.
         let rc = register_event_handler(tag, on_event, std::ptr::null_mut());
         if rc != 0 {
-            // A partially registered plugin would report misleading states.
-            reporter.shutdown();
             return rc;
-        }
-    }
-
-    if let Some(register_lifecycle) = api.register_plugin_lifecycle {
-        let rc = register_lifecycle(begin_shutdown, finish_shutdown, std::ptr::null_mut());
-        if rc != 0 {
-            reporter.shutdown();
-            return rc;
-        }
-    }
-
-    match STATE.lock() {
-        Ok(mut guard) => *guard = Some(reporter),
-        Err(_) => {
-            reporter.shutdown();
-            return 1;
         }
     }
     0
@@ -300,6 +328,19 @@ rpi_plugin_sdk::export_plugin!(|api: &PluginApi| {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::MutexGuard;
+
+    /// Serialises every test that reads or writes the process-global [`STATE`].
+    ///
+    /// The default harness runs tests in parallel, so a test that installs a
+    /// reporter would otherwise overlap `handlers_are_no_ops_before_registration`
+    /// and both would be flaky. Poisoning is ignored: a panicking test leaves no
+    /// invariant behind that the others depend on beyond the lock itself.
+    static STATE_GUARD: Mutex<()> = Mutex::new(());
+
+    fn state_guard() -> MutexGuard<'static, ()> {
+        STATE_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn the_observed_tags_are_the_ones_the_state_machine_needs() {
@@ -327,6 +368,7 @@ mod tests {
 
     #[test]
     fn finish_shutdown_reports_failure_without_a_reporter() {
+        let _guard = state_guard();
         // No reporter registered: there is no thread to join, so unloading is
         // safe and the hook must not claim failure.
         assert_eq!(finish_shutdown(std::ptr::null_mut()), 0);
@@ -334,12 +376,14 @@ mod tests {
 
     #[test]
     fn begin_and_finish_shutdown_are_safe_without_state() {
+        let _guard = state_guard();
         begin_shutdown(std::ptr::null_mut());
         assert_eq!(finish_shutdown(std::ptr::null_mut()), 0);
     }
 
     #[test]
     fn a_freshly_registered_reporter_is_reachable_from_handlers() {
+        let _guard = state_guard();
         struct Noop;
         impl crate::reporter::Runner for Noop {
             fn run(&self, _argv: &[String], _deadline: std::time::Duration) {}
@@ -376,10 +420,47 @@ mod tests {
 
     #[test]
     fn handlers_are_no_ops_before_registration() {
+        let _guard = state_guard();
         let event = rpi_plugin_sdk::StablePluginEvent::empty(EventTag::AgentStart);
         assert_eq!(
             on_event(event, std::ptr::null_mut()),
             EVENT_HANDLER_CONTINUE
+        );
+    }
+
+    #[test]
+    fn finish_shutdown_keeps_reporting_failure_after_a_failed_join() {
+        let _guard = state_guard();
+        // A worker that ignores `stop` (wedged inside `runner.run`) must never
+        // be reported as "gone": the host would unmap code that is still
+        // executing. The verdict is sticky, so a retry cannot flip it either.
+        struct Wedged;
+        impl crate::reporter::Runner for Wedged {
+            fn run(&self, _argv: &[String], _deadline: std::time::Duration) {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        }
+        impl crate::reporter::ContextSource for Wedged {
+            fn refresh(&self) -> Option<ExecContext> {
+                None
+            }
+        }
+
+        let env = env::HerdrEnv {
+            pane_id: "w18:p1".into(),
+            bin_path: std::path::PathBuf::from("/usr/bin/herdr"),
+            agent_label: "rpi".into(),
+            resume_enabled: true,
+        };
+        let reporter = Reporter::start(env, Arc::new(Wedged), Arc::new(Wedged));
+        reporter.submit(Input::RunStarted, None);
+        // Give the worker time to pick the request up and enter `run`.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        assert!(!reporter.shutdown(), "a live worker is not 'unloaded'");
+        assert!(
+            !reporter.shutdown(),
+            "a failed join must stay failed on retry"
         );
     }
 }

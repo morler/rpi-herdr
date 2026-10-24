@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::env::HerdrEnv;
 use crate::protocol::{self, Report, Target};
 use crate::resume::{self, ExecContext};
-use crate::state::{AgentState, Input};
+use crate::state::{AgentState, Input, Machine};
 
 /// How long one `herdr` call may take before it is killed and forgotten.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -33,6 +33,12 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound for pushing the final release out while still inside an event
 /// handler. Comfortably below the 15 s `SessionShutdown` budget.
 pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound for the intermediate drain on the one-shot path. It only has to let one
+/// `idle` report finish, which [`EXEC_TIMEOUT`] already caps; the long timeout
+/// stays reserved for the final release, so a wedged `herdr` cannot block the
+/// host's dispatch thread for two long waits back to back.
+pub const REPORT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One pending report. Later submissions replace earlier ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +122,14 @@ impl Runner for ProcessRunner {
             match child.try_wait() {
                 Ok(Some(_)) => return, // any exit code, including failure
                 Ok(None) => {}
-                Err(_) => return,
+                Err(_) => {
+                    // `try_wait` failed, so the child's fate is unknown: reap it
+                    // instead of leaving a live process with detached stdio (and
+                    // a zombie on Unix) that no timeout applies to any more.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
             }
             if Instant::now() >= until {
                 let _ = child.kill();
@@ -148,8 +161,13 @@ pub struct Reporter {
     /// lifecycle hook does not spawn a second `herdr` for the same outcome.
     /// Cleared as soon as a new state is reported.
     released: AtomicBool,
-    last_state: Mutex<Option<AgentState>>,
+    /// The declared state, plus whether a run is in flight.
+    machine: Mutex<Machine>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Sticky record of a `shutdown()` that could not join the worker. Once set,
+    /// every later `shutdown()` keeps reporting failure: the host must not unload
+    /// a library whose thread may still run plugin code.
+    join_failed: AtomicBool,
 }
 
 impl Reporter {
@@ -184,8 +202,9 @@ impl Reporter {
             busy,
             session_started: AtomicBool::new(false),
             released: AtomicBool::new(false),
-            last_state: Mutex::new(None),
+            machine: Mutex::new(Machine::default()),
             thread: Mutex::new(thread),
+            join_failed: AtomicBool::new(false),
         })
     }
 
@@ -201,12 +220,11 @@ impl Reporter {
             return;
         }
         let (state, changed) = {
-            let mut last = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
-            let current = last.unwrap_or(AgentState::Idle);
-            let next = current.next(input);
-            let changed = *last != Some(next);
-            *last = Some(next);
-            (next, changed)
+            let mut machine = self.machine.lock().unwrap_or_else(|e| e.into_inner());
+            let next = machine.next(input);
+            let changed = next.state() != machine.state();
+            *machine = next;
+            (next.state(), changed)
         };
         // Report only real transitions, so a chatty event stream cannot make the
         // pane flicker between identical states.
@@ -225,8 +243,11 @@ impl Reporter {
     /// cannot be swallowed by the "unchanged" filter.
     pub fn submit_release(&self) {
         {
-            let mut last = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
-            *last = None;
+            let mut machine = self.machine.lock().unwrap_or_else(|e| e.into_inner());
+            *machine = Machine::default();
+        }
+        if self.stop.load(Ordering::Acquire) {
+            return;
         }
         // Idempotent: Herdr accepts repeated releases, but a second spawn buys
         // nothing. A later state report clears the flag and re-claims the pane.
@@ -239,6 +260,9 @@ impl Reporter {
     /// Overwrite whatever is queued. A late older request can never clobber a
     /// newer one because the mailbox holds exactly one entry.
     fn publish(&self, request: Request) {
+        if self.stop.load(Ordering::Acquire) {
+            return; // a stopping reporter never starts new work
+        }
         let (lock, cv) = &*self.slot;
         let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
         if slot
@@ -272,8 +296,8 @@ impl Reporter {
                 .slot
                 .0
                 .lock()
-                .map(|guard| guard.is_none())
-                .unwrap_or(false);
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none();
             if queue_empty && !self.busy.load(Ordering::Acquire) {
                 return true;
             }
@@ -296,6 +320,13 @@ impl Reporter {
         let (_, cv) = &*self.slot;
         cv.notify_all();
 
+        // A previous attempt could not join the worker. That fact is sticky: the
+        // thread may still execute plugin code, so the host must keep this
+        // library loaded no matter how often it asks again.
+        if self.join_failed.load(Ordering::Acquire) {
+            return false;
+        }
+
         let handle = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(handle) = handle else {
             return true;
@@ -303,13 +334,21 @@ impl Reporter {
         let until = Instant::now() + SHUTDOWN_TIMEOUT;
         while !handle.is_finished() {
             if Instant::now() >= until {
-                // Still running: the host must keep the library loaded rather
-                // than unload code that is about to execute.
+                // Still running: hand the handle back so a retry can still join
+                // it, and record the failure so every later call keeps saying
+                // "not unloaded".
+                self.join_failed.store(true, Ordering::Release);
+                *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        handle.join().is_ok()
+        match handle.join() {
+            Ok(()) => true,
+            // A panicked worker is gone (its stack unwound), so unloading is
+            // safe; report success so the host is not stuck forever.
+            Err(_) => true,
+        }
     }
 }
 
@@ -333,13 +372,23 @@ fn worker_loop(
 ) {
     let (lock, cv) = &*slot;
     let mut exec_context: Option<ExecContext> = None;
-    let mut need_refresh = true;
+    let mut refreshed_for_run = false;
+
+    // Built once: the env is immutable for the worker's lifetime, and `None`
+    // means the identity Herdr would reject anyway (nothing to report).
+    let Some(target) = Target::new(&env.pane_id, &env.agent_label, crate::env::SOURCE_ID) else {
+        return;
+    };
 
     loop {
         let request = {
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(request) = guard.take() {
+                    // Claim the in-flight flag while the lock is still held, so
+                    // `flush` can never observe an empty mailbox with no call
+                    // running.
+                    busy.store(true, Ordering::Release);
                     break Some(request);
                 }
                 if stop.load(Ordering::Acquire) {
@@ -355,7 +404,6 @@ fn worker_loop(
         let Some(request) = request else {
             return; // stopping and nothing left to send
         };
-        busy.store(true, Ordering::Release);
 
         match request {
             Request::State {
@@ -363,12 +411,18 @@ fn worker_loop(
                 message,
                 session_id,
             } => {
-                // Refresh host metadata once per user prompt rather than per
-                // event: the call is a blocking host round-trip, so keep it off
-                // the hot path and off the agent's thread (this is ours).
-                if need_refresh {
-                    need_refresh = false;
+                // Refresh host metadata on every transition into `Working` (i.e.
+                // once per user prompt) rather than once per reporter lifetime:
+                // the first report usually happens before a session id, provider
+                // or model exists, so a one-shot refresh would keep a stale
+                // resume command for the rest of the session. The call is a
+                // blocking host round-trip, but this thread is ours, not the
+                // agent's.
+                if state == AgentState::Working && !refreshed_for_run {
+                    refreshed_for_run = true;
                     exec_context = context.refresh();
+                } else if state != AgentState::Working {
+                    refreshed_for_run = false;
                 }
                 let session_id = session_id.or_else(|| {
                     exec_context
@@ -382,11 +436,7 @@ fn worker_loop(
                     None
                 };
                 let argv = protocol::report_agent(
-                    &Target {
-                        pane_id: &env.pane_id,
-                        agent_label: &env.agent_label,
-                        source: crate::env::SOURCE_ID,
-                    },
+                    &target,
                     &Report {
                         state,
                         message: message.as_deref(),
@@ -398,14 +448,7 @@ fn worker_loop(
                 runner.run(&argv, EXEC_TIMEOUT);
             }
             Request::Release => {
-                let argv = protocol::release_agent(
-                    &Target {
-                        pane_id: &env.pane_id,
-                        agent_label: &env.agent_label,
-                        source: crate::env::SOURCE_ID,
-                    },
-                    seq.next(),
-                );
+                let argv = protocol::release_agent(&target, seq.next());
                 runner.run(&argv, EXEC_TIMEOUT);
             }
         }
@@ -830,5 +873,77 @@ mod tests {
         let states: Vec<_> = runner.calls().iter().filter_map(|a| state_of(a)).collect();
         assert_eq!(states, ["working", "blocked", "working"]);
         assert_eq!(AgentState::Blocked.as_str(), "blocked", "wire label sanity");
+    }
+
+    #[test]
+    fn a_dialog_outside_a_run_returns_the_pane_to_idle() {
+        // `UiPromptStart` can fire for an extension/startup prompt, i.e. with no
+        // run in flight. Reporting `working` after the dismissal would strand the
+        // pane until the next prompt.
+        let runner = RecordingRunner::new();
+        let reporter = reporter(Arc::clone(&runner), Arc::new(NoContext));
+        reporter.submit(Input::PromptShown, None);
+        assert!(runner.wait_for_call(Duration::from_secs(2)));
+        reporter.submit(Input::PromptDismissed, None);
+        assert!(runner.wait_for_call(Duration::from_secs(2)));
+        assert!(reporter.shutdown());
+
+        let states: Vec<_> = runner.calls().iter().filter_map(|a| state_of(a)).collect();
+        assert_eq!(states, ["blocked", "idle"]);
+    }
+
+    #[test]
+    fn host_metadata_is_refreshed_again_on_the_next_run() {
+        // A one-shot refresh would keep the first (usually empty) context for the
+        // rest of the session, so the resume command never learns the model.
+        #[derive(Default)]
+        struct Counting {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ContextSource for Counting {
+            fn refresh(&self) -> Option<ExecContext> {
+                let n = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+                Some(ExecContext {
+                    session_id: Some(format!("session-{n}")),
+                    ..ExecContext::default()
+                })
+            }
+        }
+
+        let runner = RecordingRunner::new();
+        let context = Arc::new(Counting::default());
+        let reporter = reporter(Arc::clone(&runner), context.clone());
+        for input in [Input::RunStarted, Input::RunEnded, Input::RunStarted] {
+            reporter.submit(input, None);
+            assert!(runner.wait_for_call(Duration::from_secs(2)), "{input:?}");
+        }
+        assert!(reporter.shutdown());
+
+        assert_eq!(
+            context.calls.load(Ordering::Acquire),
+            2,
+            "one refresh per run, not one per reporter"
+        );
+        // The idle report in between reuses the cached id rather than refreshing;
+        // the third call proves the second run picked up fresh metadata.
+        let rebuilt: Vec<_> = runner
+            .calls()
+            .iter()
+            .filter_map(|argv| {
+                let i = argv.iter().position(|a| a == "--agent-session-id")?;
+                argv.get(i + 1).cloned()
+            })
+            .collect();
+        assert_eq!(rebuilt, ["session-1", "session-1", "session-2"]);
+    }
+
+    #[test]
+    fn the_one_shot_drain_is_shorter_than_the_final_release_wait() {
+        // A back-to-back pair of long drains would block the host's dispatch
+        // thread for ~6 s per one-shot run; the intermediate wait only has to
+        // cover one bounded exec.
+        assert!(REPORT_FLUSH_TIMEOUT <= EXEC_TIMEOUT);
+        assert!(EXEC_TIMEOUT <= SHUTDOWN_FLUSH_TIMEOUT);
+        assert!(SHUTDOWN_TIMEOUT >= SHUTDOWN_FLUSH_TIMEOUT);
     }
 }

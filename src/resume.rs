@@ -40,9 +40,10 @@ pub struct ExecContext {
 
 impl ExecContext {
     /// Parse `GetExecutionContext`'s result. Unknown/missing fields stay `None`
-    /// and an `{"error": …}` reply yields an empty context.
+    /// and a real error reply (`{"error": <non-null>}`) yields an empty
+    /// context.
     pub fn from_json(value: &serde_json::Value) -> Self {
-        if value.get("error").is_some() {
+        if value.get("error").is_some_and(|error| !error.is_null()) {
             return Self::default();
         }
         let model = value.get("model");
@@ -77,11 +78,14 @@ impl ExecContext {
     }
 }
 
-/// A session id we can actually reopen: non-blank and not the ephemeral
-/// placeholder. Anything else means "this session cannot be resumed".
+/// A session id we can actually reopen: non-blank, not the ephemeral
+/// placeholder, and safe to hand to Herdr as one argv element. Anything else
+/// means "this candidate cannot be used", which lets the caller fall back to
+/// the next one instead of dropping the resume entirely.
 fn usable_id(id: &str) -> Option<&str> {
     let id = id.trim();
-    (!id.is_empty() && !id.eq_ignore_ascii_case(EPHEMERAL_SESSION_ID)).then_some(id)
+    (!id.is_empty() && !id.eq_ignore_ascii_case(EPHEMERAL_SESSION_ID) && is_safe_arg(id))
+        .then_some(id)
 }
 
 fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -96,38 +100,43 @@ fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
 /// Build the resume argv: `rpi --session-id <id> [--provider p] [--model m]
 /// [--thinking l]`.
 ///
-/// Returns `None` when there is no usable session id, or when the candidate
-/// command cannot satisfy Herdr's constraints.
+/// The id candidates are tried in order (the event's id, then the host's), so an
+/// unsafe explicit id degrades to a usable fallback instead of losing the
+/// command.
+///
+/// Returns `None` when no candidate is usable, or when the resulting command
+/// cannot satisfy Herdr's constraints.
 pub fn build(session_id: Option<&str>, exec: Option<&ExecContext>) -> Option<Vec<String>> {
     let session_id = session_id
         .and_then(usable_id)
         .or_else(|| {
             exec.and_then(|c| c.session_id.as_deref())
                 .and_then(usable_id)
-        })
-        .map(str::to_string);
-    let session_id = session_id?;
+        })?
+        .to_string();
 
     let mut argv = vec![
         COMMAND.to_string(),
         "--session-id".to_string(),
-        session_id.to_string(),
+        session_id.clone(),
     ];
 
     if let Some(exec) = exec {
-        // Optional flags are all-or-nothing individually: an unusable value is
-        // skipped rather than poisoning the whole resume command.
-        if let Some(provider) = &exec.provider {
-            argv.push("--provider".to_string());
-            argv.push(provider.clone());
-        }
-        if let Some(model) = &exec.model {
-            argv.push("--model".to_string());
-            argv.push(model.clone());
-        }
-        if let Some(level) = &exec.thinking_level {
-            argv.push("--thinking".to_string());
-            argv.push(level.clone());
+        // Optional flags are best-effort: a value that is blank or violates
+        // Herdr's argument rules is skipped individually. If the survivors still
+        // break a limit, the fallback below drops all of them at once.
+        for (flag, value) in [
+            ("--provider", exec.provider.as_deref()),
+            ("--model", exec.model.as_deref()),
+            ("--thinking", exec.thinking_level.as_deref()),
+        ] {
+            if let Some(value) = value
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && is_safe_arg(v))
+            {
+                argv.push(flag.to_string());
+                argv.push(value.to_string());
+            }
         }
     }
 
@@ -140,13 +149,25 @@ pub fn build(session_id: Option<&str>, exec: Option<&ExecContext>) -> Option<Vec
     }
 }
 
-/// Check every Herdr resume constraint. Exposed so tests and the reporter agree
-/// on exactly one definition of "acceptable".
+/// Check Herdr's generic argv-shape constraints: a bare program name, no single
+/// quote or control character in any element, at most [`MAX_ARGS`] arguments and
+/// at most [`MAX_ARGV_BYTES`] bytes in total.
+///
+/// Rule 5 ("a session id is mandatory") is **not** enforced here — it is a
+/// property of a *resume command*, not of an argv shape, and it lives in
+/// [`build`]. Exposed so tests and the reporter agree on one definition of
+/// "Herdr will accept this argv".
 pub fn validate(argv: &[String]) -> bool {
     let Some(program) = argv.first() else {
         return false;
     };
-    if program.is_empty() || program.contains(['/', '\\']) {
+    // A bare command name: no path separator, and no whitespace either — an
+    // element like `"rpi --session-id abc"` is Herdr's documented
+    // `invalid_resume_argv` failure (a whole shell line passed as one argument).
+    if program.is_empty()
+        || program.contains(['/', '\\'])
+        || program.chars().any(char::is_whitespace)
+    {
         return false;
     }
     if argv.len() > MAX_ARGS {
@@ -158,8 +179,15 @@ pub fn validate(argv: &[String]) -> bool {
     total_len(argv) <= MAX_ARGV_BYTES
 }
 
-/// No single quotes (they would trip a shell-quoting restore path) and no
-/// control characters (newlines, NULs, tabs) in any argument.
+/// No single quotes and no control characters (newlines, NULs, tabs) in any
+/// argument.
+///
+/// Herdr stores the argv as an array and re-executes it without a shell
+/// (`docs/herdr-integration.md` §7 rule 8), so the other shell metacharacters
+/// (`"`, `` ` ``, `$`, `;`, `\`) are *data* and need no filtering. The single
+/// quote is the one exception Herdr itself rejects, which is why it is banned
+/// on this side too.
+#[cfg_attr(test, allow(dead_code))]
 fn is_safe_arg(arg: &str) -> bool {
     !arg.contains('\'') && !arg.chars().any(char::is_control)
 }
@@ -260,31 +288,100 @@ mod tests {
     }
 
     #[test]
-    fn a_quote_in_an_optional_value_drops_the_whole_argv() {
+    fn a_quote_in_an_optional_value_drops_only_that_flag() {
         let poisoned = ExecContext {
             model: Some("bad'model".into()),
             ..context()
         };
-        let built = build(Some("01abc"), Some(&poisoned)).expect("minimal argv survives");
-        assert_eq!(built, argv(&["rpi", "--session-id", "01abc"]));
+        let built = build(Some("01abc"), Some(&poisoned)).expect("optional flags survive");
+        assert_eq!(
+            built,
+            argv(&[
+                "rpi",
+                "--session-id",
+                "01abc",
+                "--provider",
+                "anthropic",
+                "--thinking",
+                "high",
+            ])
+        );
     }
 
     #[test]
-    fn control_characters_are_rejected_but_fall_back_to_the_minimum() {
+    fn a_blank_optional_value_is_skipped() {
+        let spaced = ExecContext {
+            provider: Some("   ".into()),
+            model: Some("  claude-sonnet-5  ".into()),
+            ..context()
+        };
+        let built = build(Some("01abc"), Some(&spaced)).expect("minimal argv");
+        assert_eq!(
+            built,
+            argv(&[
+                "rpi",
+                "--session-id",
+                "01abc",
+                "--model",
+                "claude-sonnet-5",
+                "--thinking",
+                "high",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_unsafe_explicit_id_falls_back_to_the_context_id() {
+        // Dropping the whole command here would make a poisoned event id lose a
+        // perfectly resumable session.
+        let built = build(Some("bad'id"), Some(&context())).expect("context id is usable");
+        assert_eq!(built[2], "abc");
+        assert!(validate(&built));
+    }
+
+    #[test]
+    fn a_control_character_in_an_explicit_id_also_falls_back() {
+        let built = build(Some("bad\nid"), Some(&context())).expect("context id is usable");
+        assert_eq!(built[2], "abc");
+    }
+
+    #[test]
+    fn control_characters_are_dropped_without_poisoning_the_rest() {
         for value in ["line\nbreak", "tab\there", "nul\0byte", "cr\rreturn"] {
             let poisoned = ExecContext {
                 provider: Some(value.into()),
                 ..context()
             };
             let built = build(Some("01abc"), Some(&poisoned)).expect("minimal argv");
-            assert_eq!(built.len(), 3, "{value:?} must not reach Herdr");
+            assert!(
+                !built.iter().any(|arg| arg == value),
+                "{value:?} must not reach Herdr"
+            );
+            assert!(!built.iter().any(|arg| arg == "--provider"), "{built:?}");
+            // The other optional values are still intact.
+            assert!(built.iter().any(|arg| arg == "--model"), "{built:?}");
         }
     }
 
     #[test]
-    fn a_poisoned_session_id_drops_the_command_entirely() {
+    fn a_poisoned_session_id_alone_drops_the_command_and_says_so() {
+        // No usable fallback: the command is dropped, but `validate` remains a
+        // pure argv-shape check (it does not require a session id).
         assert!(build(Some("bad'id"), None).is_none());
         assert!(build(Some("bad\nid"), None).is_none());
+        assert!(
+            validate(&argv(&["rpi"])),
+            "validate checks argv shape, not resumability"
+        );
+    }
+
+    #[test]
+    fn a_whole_shell_line_as_one_argument_is_rejected() {
+        // Herdr's documented failure: the resume command must be an argv array,
+        // never a joined string.
+        assert!(!validate(&argv(&["rpi --session-id abc"])));
+        assert!(!validate(&argv(&["rpi --session-id", "abc"])));
+        assert!(validate(&argv(&["rpi", "--session-id", "abc"])));
     }
 
     #[test]
@@ -355,6 +452,19 @@ mod tests {
             ExecContext::from_json(&serde_json::json!({"error": "no session"})),
             ExecContext::default()
         );
+        assert_eq!(
+            ExecContext::from_json(&serde_json::json!({"error": {"code": "x"}})),
+            ExecContext::default()
+        );
+        // A null `error` is a success envelope: keep the payload.
+        let ok = ExecContext::from_json(&serde_json::json!({
+            "error": null,
+            "sessionId": "01abc",
+            "model": {"id": "claude-sonnet-5"}
+        }));
+        assert_eq!(ok.session_id.as_deref(), Some("01abc"));
+        assert_eq!(ok.model.as_deref(), Some("claude-sonnet-5"));
+
         assert_eq!(
             ExecContext::from_json(&serde_json::json!({})),
             ExecContext::default()

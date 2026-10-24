@@ -1,4 +1,19 @@
-/target
-Cargo.lock
-/.rpi/extensions
-/.rpi/sessions
+# Build output at any depth: a future workspace or an example crate brings its
+# own `target/`.
+target/
+**/target/
+
+# A shipped cdylib must be reproducible: `rpi-plugin-sdk = "0.8"` is a caret
+# requirement, so the lockfile stays tracked on purpose. Do not add `Cargo.lock`
+# to this file.
+
+# Local agent state (sessions, dev-loaded extension binaries).
+.rpi/
+**/.rpi/
+
+# Local/secret and editor/OS artifacts.
+.env
+.env.*
+.DS_Store
+.vscode/
+.idea/
