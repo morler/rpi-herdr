@@ -9,8 +9,8 @@ readme = "README.md"
 # Provenance for registries and downstream consumers (`cargo publish` warns
 # without it). The plugin is distributed as a prebuilt cdylib, so the crate is
 # the single source of truth for that binary.
-repository = "https://github.com/pi-rust/rpi-package"
-homepage = "https://github.com/pi-rust/rpi-package/tree/main/packages/rpi-herdr"
+repository = "https://github.com/morler/rpi-herdr"
+homepage = "https://github.com/morler/rpi-herdr"
 documentation = "https://docs.rs/rpi-herdr"
 keywords = ["rpi", "herdr", "extension", "agent"]
 categories = ["development-tools"]
