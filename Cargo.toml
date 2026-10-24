@@ -14,11 +14,7 @@ homepage = "https://github.com/morler/rpi-herdr"
 documentation = "https://docs.rs/rpi-herdr"
 keywords = ["rpi", "herdr", "extension", "agent"]
 categories = ["development-tools"]
-# `cargo package` would otherwise fall back to every VCS-tracked file, dragging
-# `docs/` (internal design notes with SDK line references) into the published
-# crate. Ship only what the cdylib needs. `Cargo.lock` is intentionally present:
-# a shipped plugin binary must be reproducible, and `rpi-plugin-sdk = "0.8"` is a
-# caret requirement that would otherwise float across patch releases.
+# Ship only what the cdylib needs; the design notes stay out of the crate.
 include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [lib]

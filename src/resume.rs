@@ -182,11 +182,10 @@ pub fn validate(argv: &[String]) -> bool {
 /// No single quotes and no control characters (newlines, NULs, tabs) in any
 /// argument.
 ///
-/// Herdr stores the argv as an array and re-executes it without a shell
-/// (`docs/herdr-integration.md` §7 rule 8), so the other shell metacharacters
-/// (`"`, `` ` ``, `$`, `;`, `\`) are *data* and need no filtering. The single
-/// quote is the one exception Herdr itself rejects, which is why it is banned
-/// on this side too.
+/// Herdr stores the argv as an array and re-executes it without a shell, so the
+/// other shell metacharacters (`"`, `` ` ``, `$`, `;`, `\`) are *data* and need
+/// no filtering. The single quote is the one exception Herdr itself rejects,
+/// which is why it is banned on this side too.
 #[cfg_attr(test, allow(dead_code))]
 fn is_safe_arg(arg: &str) -> bool {
     !arg.contains('\'') && !arg.chars().any(char::is_control)
