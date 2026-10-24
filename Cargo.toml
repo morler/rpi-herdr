@@ -1,0 +1,22 @@
+[package]
+name = "rpi-herdr"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+description = "Reports rpi agent state, session resume command and pane release to Herdr."
+readme = "README.md"
+keywords = ["rpi", "herdr", "extension", "agent"]
+categories = ["development-tools"]
+
+[lib]
+# cdylib for the host loader; rlib so `cargo test` can link the modules.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-plugin-sdk = "0.8"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

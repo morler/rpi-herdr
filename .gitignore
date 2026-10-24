@@ -1,0 +1,4 @@
+/target
+Cargo.lock
+/.rpi/extensions
+/.rpi/sessions
