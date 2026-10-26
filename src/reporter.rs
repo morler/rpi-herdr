@@ -34,11 +34,16 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// handler. Comfortably below the 15 s `SessionShutdown` budget.
 pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Bound for the intermediate drain on the one-shot path. It only has to let one
-/// `idle` report finish, which [`EXEC_TIMEOUT`] already caps; the long timeout
-/// stays reserved for the final release, so a wedged `herdr` cannot block the
-/// host's dispatch thread for two long waits back to back.
-pub const REPORT_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often the current state is re-sent even though it did not change.
+///
+/// Herdr drops a pane's agent authority on its own — its process detection
+/// settles, an unrelated report on the same pane releases the slot, the server
+/// reloads its config, `/reload` swaps this library out — and a plugin that
+/// only speaks on transitions then stays invisible until the *next* transition,
+/// which can be minutes. A cheap repeat keeps the pane honest; ten seconds is
+/// well inside the window a user would notice, and one `herdr` call per beat is
+/// noise next to a running agent.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// One pending report. Later submissions replace earlier ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,21 +153,44 @@ pub trait ContextSource: Send + Sync + 'static {
     fn refresh(&self) -> Option<ExecContext>;
 }
 
+/// State shared between the handler side and the worker thread.
+///
+/// One lock guards the machine and the cached session id together: a heartbeat
+/// must see exactly the state a concurrent transition just declared, not a
+/// half-updated pair.
+struct Shared {
+    /// Set once the host proves an interactive TUI is running, either by
+    /// dispatching `BeforeTuiStart` or because the host's argv says so. Until
+    /// then nothing is claimed: a `-p`/`--mode json` run has no PTY Herdr could
+    /// display, and claiming the pane there would steal the slot from the TUI
+    /// that is already using it — its eventual release is what used to blank a
+    /// *working* agent out of the sidebar.
+    interactive: AtomicBool,
+    /// Set once a release was published, so `SessionShutdown` followed by the
+    /// lifecycle hook does not spawn a second `herdr` for the same outcome.
+    /// Cleared as soon as a new state is reported.
+    released: AtomicBool,
+    /// Whether `SessionStart` was ever dispatched to *this* instance.
+    ///
+    /// `/reload` loads a new library and sends it `SessionShutdown` without ever
+    /// sending `SessionStart`, so this is what tells a real exit apart from that
+    /// fake one. Guarding on it is what keeps a reload from blanking a running
+    /// agent out of the sidebar.
+    saw_session_start: AtomicBool,
+    /// The declared state, plus whether a run is in flight.
+    machine: Mutex<Machine>,
+    /// The session id from the newest event, so a heartbeat can repeat it
+    /// instead of re-deriving it from the host on every beat.
+    session_id: Mutex<Option<String>>,
+}
+
 /// Owning handle for the reporting thread. Dropping it signals shutdown.
 pub struct Reporter {
     slot: Arc<(Mutex<Option<Request>>, Condvar)>,
     stop: Arc<AtomicBool>,
     /// True while the worker is inside `runner.run(..)` for one request.
     busy: Arc<AtomicBool>,
-    /// Whether the host dispatched `SessionStart`, i.e. this is a long-lived
-    /// session (TUI/REPL/rpc) rather than a one-shot run.
-    session_started: AtomicBool,
-    /// Set once a release was published, so `SessionShutdown` followed by the
-    /// lifecycle hook does not spawn a second `herdr` for the same outcome.
-    /// Cleared as soon as a new state is reported.
-    released: AtomicBool,
-    /// The declared state, plus whether a run is in flight.
-    machine: Mutex<Machine>,
+    shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Sticky record of a `shutdown()` that could not join the worker. Once set,
     /// every later `shutdown()` keeps reporting failure: the host must not unload
@@ -178,21 +206,66 @@ impl Reporter {
         runner: Arc<dyn Runner>,
         context: Arc<dyn ContextSource>,
     ) -> Arc<Self> {
+        Self::start_with_heartbeat(env, runner, context, HEARTBEAT_INTERVAL)
+    }
+
+    /// Start and, when this process drives a TUI, claim the pane immediately.
+    ///
+    /// The claim cannot wait for an event: `/reload` loads this library
+    /// mid-session without re-dispatching `BeforeTuiStart` or `SessionStart`, so
+    /// an event-gated plugin stays invisible until the next turn — which for an
+    /// idle agent can be hours.
+    pub fn start_in_current_mode(
+        env: HerdrEnv,
+        runner: Arc<dyn Runner>,
+        context: Arc<dyn ContextSource>,
+    ) -> Arc<Self> {
+        let reporter = Self::start(env, runner, context);
+        if crate::env::is_interactive_process() {
+            reporter.enter_interactive();
+        }
+        reporter
+    }
+
+    /// [`Self::start`] with an explicit heartbeat period, so tests do not have to
+    /// wait ten real seconds for the second beat.
+    fn start_with_heartbeat(
+        env: HerdrEnv,
+        runner: Arc<dyn Runner>,
+        context: Arc<dyn ContextSource>,
+        heartbeat: Duration,
+    ) -> Arc<Self> {
         let slot = Arc::new((Mutex::new(None::<Request>), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(AtomicBool::new(false));
         let seq = Arc::new(SeqGen::default());
+        let shared = Arc::new(Shared {
+            interactive: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            saw_session_start: AtomicBool::new(false),
+            machine: Mutex::new(Machine::default()),
+            session_id: Mutex::new(None),
+        });
 
         let thread = {
-            let slot = Arc::clone(&slot);
-            let stop = Arc::clone(&stop);
-            let busy = Arc::clone(&busy);
-            let seq = Arc::clone(&seq);
+            let worker = Worker {
+                env,
+                runner,
+                context,
+                slot: Arc::clone(&slot),
+                stop: Arc::clone(&stop),
+                busy: Arc::clone(&busy),
+                seq: Arc::clone(&seq),
+                shared: Arc::clone(&shared),
+                heartbeat,
+                exec_context: None,
+                refreshed_for_run: false,
+            };
             std::thread::Builder::new()
                 .name("rpi-herdr".to_string())
                 // A failure to spawn a thread must not take the agent down; the
                 // plugin then simply reports nothing.
-                .spawn(move || worker_loop(env, runner, context, slot, stop, busy, seq))
+                .spawn(move || worker_loop(worker))
                 .ok()
         };
 
@@ -200,12 +273,66 @@ impl Reporter {
             slot,
             stop,
             busy,
-            session_started: AtomicBool::new(false),
-            released: AtomicBool::new(false),
-            machine: Mutex::new(Machine::default()),
+            shared,
             thread: Mutex::new(thread),
             join_failed: AtomicBool::new(false),
         })
+    }
+
+    /// Enter interactive mode: from here on the pane is claimed and kept alive by
+    /// the heartbeat.
+    ///
+    /// Idempotent and cheap to repeat: start-up calls it once from the argv check,
+    /// `BeforeTuiStart` calls it again. The state machine is untouched and the
+    /// mailbox is a single slot, so the second call collapses into the first when
+    /// the first report has not left yet.
+    pub fn enter_interactive(&self) {
+        self.shared.interactive.store(true, Ordering::Release);
+        // Claim immediately instead of waiting for the first prompt: between
+        // start-up and the first keystroke the pane otherwise carries no agent at
+        // all, which is the "rpi is running but not in the list" report.
+        self.publish_current();
+    }
+
+    /// Record that `SessionStart` reached *this* instance.
+    ///
+    /// This is what separates a real shutdown from the one `/reload` fakes: the
+    /// host dispatches a `SessionShutdown` to the freshly loaded library without
+    /// ever sending it a `SessionStart`, so a release from an instance that never
+    /// saw the start would blank a session that is in fact still running.
+    pub fn note_session_start(&self) {
+        self.shared.saw_session_start.store(true, Ordering::Release);
+    }
+
+    /// Queue the current declared state, bypassing the "did it change" filter.
+    /// Used for the initial claim and every heartbeat.
+    fn publish_current(&self) {
+        if self.stop.load(Ordering::Acquire)
+            || !self.shared.interactive.load(Ordering::Acquire)
+            || self.shared.released.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let (state, session_id) = {
+            let machine = self
+                .shared
+                .machine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session_id = self
+                .shared
+                .session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            (machine.state(), session_id)
+        };
+        self.shared.released.store(false, Ordering::Release);
+        self.publish(Request::State {
+            state,
+            message: None,
+            session_id,
+        });
     }
 
     /// Feed one input to the state machine and publish the resulting state.
@@ -213,25 +340,39 @@ impl Reporter {
     /// Never blocks on I/O: the handler path stays in the microsecond range so
     /// event-log budgets (10 s for `BeforeAgentStart`) are never approached.
     pub fn submit(&self, input: Input, session_id: Option<String>) {
-        if input == Input::SessionReady {
-            self.session_started.store(true, Ordering::Release);
-        }
         if self.stop.load(Ordering::Acquire) {
             return;
         }
+        let interactive = self.shared.interactive.load(Ordering::Acquire);
         let (state, changed) = {
-            let mut machine = self.machine.lock().unwrap_or_else(|e| e.into_inner());
+            let mut machine = self
+                .shared
+                .machine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let next = machine.next(input);
             let changed = next.state() != machine.state();
             *machine = next;
+            if session_id.is_some() {
+                *self
+                    .shared
+                    .session_id
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = session_id.clone();
+            }
             (next.state(), changed)
         };
+        // Nothing is claimed outside a TUI, so a transition there is news for
+        // nobody: a one-shot run would only fight the TUI for the same slot.
+        if !interactive {
+            return;
+        }
         // Report only real transitions, so a chatty event stream cannot make the
         // pane flicker between identical states.
         if !changed {
             return;
         }
-        self.released.store(false, Ordering::Release);
+        self.shared.released.store(false, Ordering::Release);
         self.publish(Request::State {
             state,
             message: None,
@@ -243,15 +384,33 @@ impl Reporter {
     /// cannot be swallowed by the "unchanged" filter.
     pub fn submit_release(&self) {
         {
-            let mut machine = self.machine.lock().unwrap_or_else(|e| e.into_inner());
+            let mut machine = self
+                .shared
+                .machine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *machine = Machine::default();
         }
         if self.stop.load(Ordering::Acquire) {
             return;
         }
+        // A non-interactive run never claimed the pane, so it has nothing to
+        // release — and releasing anyway is what used to wipe the parent TUI's
+        // ownership out of the sidebar.
+        if !self.shared.interactive.load(Ordering::Acquire) {
+            return;
+        }
+        // A `/reload` dispatches `SessionShutdown` to the freshly loaded library
+        // even though the session continues. That instance never saw
+        // `SessionStart`, so its release would blank a *running* agent — the
+        // exact "rpi is working but not in the list" symptom. Real exits are
+        // unaffected: every ordinary session gets `SessionStart` first.
+        if !self.shared.saw_session_start.load(Ordering::Acquire) {
+            return;
+        }
         // Idempotent: Herdr accepts repeated releases, but a second spawn buys
         // nothing. A later state report clears the flag and re-claims the pane.
-        if self.released.swap(true, Ordering::AcqRel) {
+        if self.shared.released.swap(true, Ordering::AcqRel) {
             return;
         }
         self.publish(Request::Release);
@@ -276,12 +435,19 @@ impl Reporter {
         cv.notify_one();
     }
 
-    /// Whether the host ever announced a session. `false` after a run means a
-    /// one-shot mode (`-p`, `--mode json`) that dispatches no `SessionStart` and
-    /// no `SessionShutdown` — the agent is about to exit, so the report must be
-    /// released proactively.
-    pub fn is_one_shot_run(&self) -> bool {
-        !self.session_started.load(Ordering::Acquire)
+    /// Mark this reporter interactive *without* the initial claim, so a test can
+    /// count the calls a transition produces on its own.
+    #[cfg(test)]
+    pub(crate) fn mark_interactive_silently(&self) {
+        self.shared.interactive.store(true, Ordering::Release);
+        self.shared.saw_session_start.store(true, Ordering::Release);
+    }
+
+    /// Exactly what a `/reload`ed instance looks like: interactive, but it never
+    /// received a `SessionStart`.
+    #[cfg(test)]
+    fn interactive_without_session_start(&self) {
+        self.shared.interactive.store(true, Ordering::Release);
     }
 
     /// Block (up to `timeout`) until nothing is queued and no call is in
@@ -360,8 +526,9 @@ pub fn millis_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The reporting loop. The only place that spawns `herdr`.
-fn worker_loop(
+/// Everything the worker thread owns. Bundled so the loop keeps a readable
+/// signature and the per-run caches live in one place.
+struct Worker {
     env: HerdrEnv,
     runner: Arc<dyn Runner>,
     context: Arc<dyn ContextSource>,
@@ -369,42 +536,133 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
     seq: Arc<SeqGen>,
-) {
-    let (lock, cv) = &*slot;
-    let mut exec_context: Option<ExecContext> = None;
-    let mut refreshed_for_run = false;
+    shared: Arc<Shared>,
+    heartbeat: Duration,
+    /// Host metadata, refreshed once per run.
+    exec_context: Option<ExecContext>,
+    refreshed_for_run: bool,
+}
 
-    // Built once: the env is immutable for the worker's lifetime, and `None`
-    // means the identity Herdr would reject anyway (nothing to report).
-    let Some(target) = Target::new(&env.pane_id, &env.agent_label, crate::env::SOURCE_ID) else {
+/// The reporting loop. The only place that spawns `herdr`.
+fn worker_loop(mut worker: Worker) {
+    // Own clones: the loop needs `&mut worker`, so it cannot also borrow its
+    // mailbox through `worker`.
+    let slot = Arc::clone(&worker.slot);
+    let (lock, cv) = &*slot;
+    let mut last_sent = Instant::now();
+
+    // Validated once: the env is immutable for the worker's lifetime, and `None`
+    // means the identity Herdr would reject anyway (nothing to report). The
+    // target itself is rebuilt per call, so it can borrow `worker` immutably
+    // while the loop holds it mutably.
+    if Target::new(
+        &worker.env.pane_id,
+        &worker.env.agent_label,
+        crate::env::SOURCE_ID,
+    )
+    .is_none()
+    {
         return;
-    };
+    }
 
     loop {
-        let request = {
+        let (request, idle) = {
             let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(request) = guard.take() {
                     // Claim the in-flight flag while the lock is still held, so
                     // `flush` can never observe an empty mailbox with no call
                     // running.
-                    busy.store(true, Ordering::Release);
-                    break Some(request);
+                    worker.busy.store(true, Ordering::Release);
+                    break (Some(request), false);
                 }
-                if stop.load(Ordering::Acquire) {
-                    break None;
+                if worker.stop.load(Ordering::Acquire) {
+                    break (None, false);
                 }
+                // Wake on the beat as well as on new work, so a state that has
+                // not changed is still re-asserted.
+                let remaining = worker.heartbeat.saturating_sub(last_sent.elapsed());
                 let (next, _) = cv
-                    .wait_timeout(guard, Duration::from_millis(250))
+                    .wait_timeout(guard, remaining.min(Duration::from_millis(250)))
                     .unwrap_or_else(|e| e.into_inner());
                 guard = next;
+                if guard.is_none()
+                    && !worker.stop.load(Ordering::Acquire)
+                    && last_sent.elapsed() >= worker.heartbeat
+                {
+                    break (None, true);
+                }
             }
         };
 
-        let Some(request) = request else {
-            return; // stopping and nothing left to send
+        let request = match request {
+            Some(request) => request,
+            None if idle => {
+                // The beat: re-send the state that is already known. Nothing is
+                // claimed while the run is headless or already released, and
+                // `beat_request` checks both.
+                worker.busy.store(true, Ordering::Release);
+                last_sent = Instant::now();
+                if let Some(request) = beat_request(&worker.shared) {
+                    worker.send(&request);
+                }
+                worker.busy.store(false, Ordering::Release);
+                continue;
+            }
+            None => return, // stopping and nothing left to send
         };
+        last_sent = Instant::now();
+        worker.send(&request);
+        worker.busy.store(false, Ordering::Release);
+    }
+}
 
+/// The request a heartbeat repeats, or `None` when this run must stay invisible.
+///
+/// A release does *not* stop the beat. `/reload` dispatches a `SessionShutdown`
+/// to the freshly loaded instance even though the session keeps running, so a
+/// beat gated on "already released" would leave the pane permanently unclaimed
+/// — the exact symptom of an idle agent missing from Herdr's list. A genuine
+/// shutdown is unaffected: `begin_shutdown` stops the reporter, and `publish`
+/// refuses work once `stop` is set, so no beat can follow it.
+fn beat_request(shared: &Shared) -> Option<Request> {
+    if !shared.interactive.load(Ordering::Acquire) {
+        return None;
+    }
+    // A state report re-claims the pane, so the next release must be allowed to
+    // fire again instead of being swallowed as a duplicate.
+    shared.released.store(false, Ordering::Release);
+    let state = shared
+        .machine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .state();
+    let session_id = shared
+        .session_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Some(Request::State {
+        state,
+        message: None,
+        session_id,
+    })
+}
+
+impl Worker {
+    /// Execute one request. Split out of the loop so the beat and the event path go
+    /// through exactly the same argv construction.
+    fn send(&mut self, request: &Request) {
+        // Immutable borrows of `self` are fine here: `Target` only lives for the
+        // duration of the call.
+        let Some(target) = Target::new(
+            &self.env.pane_id,
+            &self.env.agent_label,
+            crate::env::SOURCE_ID,
+        ) else {
+            return;
+        };
+        let target = &target;
         match request {
             Request::State {
                 state,
@@ -418,41 +676,40 @@ fn worker_loop(
                 // resume command for the rest of the session. The call is a
                 // blocking host round-trip, but this thread is ours, not the
                 // agent's.
-                if state == AgentState::Working && !refreshed_for_run {
-                    refreshed_for_run = true;
-                    exec_context = context.refresh();
-                } else if state != AgentState::Working {
-                    refreshed_for_run = false;
+                if *state == AgentState::Working && !self.refreshed_for_run {
+                    self.refreshed_for_run = true;
+                    self.exec_context = self.context.refresh();
+                } else if *state != AgentState::Working {
+                    self.refreshed_for_run = false;
                 }
-                let session_id = session_id.or_else(|| {
-                    exec_context
+                let session_id = session_id.clone().or_else(|| {
+                    self.exec_context
                         .as_ref()
                         .and_then(|c| c.session_id.clone())
                         .or_else(|| std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok())
                 });
-                let resume_argv = if env.resume_enabled {
-                    resume::build(session_id.as_deref(), exec_context.as_ref())
+                let resume_argv = if self.env.resume_enabled {
+                    resume::build(session_id.as_deref(), self.exec_context.as_ref())
                 } else {
                     None
                 };
                 let argv = protocol::report_agent(
-                    &target,
+                    target,
                     &Report {
-                        state,
+                        state: *state,
                         message: message.as_deref(),
-                        seq: seq.next(),
+                        seq: self.seq.next(),
                         session_id: session_id.as_deref(),
                         resume_argv: resume_argv.as_deref(),
                     },
                 );
-                runner.run(&argv, EXEC_TIMEOUT);
+                self.runner.run(&argv, EXEC_TIMEOUT);
             }
             Request::Release => {
-                let argv = protocol::release_agent(&target, seq.next());
-                runner.run(&argv, EXEC_TIMEOUT);
+                let argv = protocol::release_agent(target, self.seq.next());
+                self.runner.run(&argv, EXEC_TIMEOUT);
             }
         }
-        busy.store(false, Ordering::Release);
     }
 }
 
@@ -584,7 +841,19 @@ mod tests {
     }
 
     fn reporter(runner: Arc<RecordingRunner>, context: Arc<dyn ContextSource>) -> Arc<Reporter> {
-        Reporter::start(test_env(), runner, context)
+        reporter_with_heartbeat(runner, context, Duration::from_secs(3600))
+    }
+
+    /// A reporter in interactive mode with a heartbeat far in the future, so
+    /// call-count assertions only see transition-driven reports.
+    fn reporter_with_heartbeat(
+        runner: Arc<RecordingRunner>,
+        context: Arc<dyn ContextSource>,
+        heartbeat: Duration,
+    ) -> Arc<Reporter> {
+        let reporter = Reporter::start_with_heartbeat(test_env(), runner, context, heartbeat);
+        reporter.mark_interactive_silently();
+        reporter
     }
 
     #[test]
@@ -700,6 +969,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_instance_never_releases_the_pane_it_did_not_claim() {
+        // `/reload` loads a fresh library and dispatches `SessionShutdown` to it
+        // *without* a `SessionStart`, even though the session keeps running. That
+        // release is what blanked a working agent out of the sidebar: the pane is
+        // owned by `source=rpi`, and a release clears the whole slot.
+        let runner = RecordingRunner::new();
+        let reporter = Reporter::start_with_heartbeat(
+            test_env(),
+            Arc::clone(&runner) as Arc<dyn Runner>,
+            Arc::new(NoContext),
+            Duration::from_secs(3600),
+        );
+        // Exactly what a reloaded instance sees: no `SessionStart`, but the
+        // lifecycle hook and `SessionShutdown` still arrive.
+        reporter.interactive_without_session_start();
+        reporter.submit_release();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            runner.calls().is_empty(),
+            "a reloaded instance must not release, got {:?}",
+            runner.calls()
+        );
+        assert!(reporter.shutdown());
+    }
+
+    #[test]
     fn release_clears_the_agent_and_stops_the_thread() {
         let runner = RecordingRunner::new();
         let reporter = reporter(Arc::clone(&runner), Arc::new(NoContext));
@@ -796,6 +1091,7 @@ mod tests {
             Arc::clone(&runner) as Arc<dyn Runner>,
             Arc::new(NoContext),
         );
+        reporter.mark_interactive_silently();
         reporter.submit(Input::PromptStarted, Some("01abc".into()));
         assert!(runner.wait_for_call(Duration::from_secs(2)));
         assert!(reporter.shutdown());
@@ -938,12 +1234,139 @@ mod tests {
     }
 
     #[test]
-    fn the_one_shot_drain_is_shorter_than_the_final_release_wait() {
-        // A back-to-back pair of long drains would block the host's dispatch
-        // thread for ~6 s per one-shot run; the intermediate wait only has to
-        // cover one bounded exec.
-        assert!(REPORT_FLUSH_TIMEOUT <= EXEC_TIMEOUT);
+    fn the_timeouts_respect_their_budgets() {
+        // A flush sits inside an event handler, so it must stay well below the
+        // 15 s `SessionShutdown` budget, and one bounded exec must fit inside it.
         assert!(EXEC_TIMEOUT <= SHUTDOWN_FLUSH_TIMEOUT);
         assert!(SHUTDOWN_TIMEOUT >= SHUTDOWN_FLUSH_TIMEOUT);
+    }
+
+    #[test]
+    fn a_headless_run_never_claims_the_pane() {
+        // The bug this guards: `rpi -p` inherits `HERDR_*` from the TUI that
+        // started it and used to claim the same (pane, source, agent) slot, then
+        // release it on exit — wiping the parent out of Herdr's agent list
+        // while it was still working.
+        let runner = RecordingRunner::new();
+        let reporter = Reporter::start(
+            test_env(),
+            Arc::clone(&runner) as Arc<dyn Runner>,
+            Arc::new(NoContext),
+        );
+        for input in [
+            Input::PromptStarted,
+            Input::RunStarted,
+            Input::RunEnded,
+            Input::PromptShown,
+            Input::PromptDismissed,
+        ] {
+            reporter.submit(input, Some("01abc".into()));
+        }
+        reporter.submit_release();
+        reporter.flush(Duration::from_millis(200));
+        assert!(
+            runner.calls().is_empty(),
+            "a headless run must be invisible to Herdr, got {:?}",
+            runner.calls()
+        );
+        assert!(reporter.shutdown());
+    }
+
+    #[test]
+    fn entering_interactive_claims_the_pane_before_any_prompt() {
+        // Between TUI startup and the first keystroke there is no transition to
+        // report, so the claim has to happen on entry — otherwise the pane sits
+        // in Herdr with no agent at all until the user types something.
+        let runner = RecordingRunner::new();
+        let reporter = Reporter::start(
+            test_env(),
+            Arc::clone(&runner) as Arc<dyn Runner>,
+            Arc::new(NoContext),
+        );
+        reporter.enter_interactive();
+        assert!(runner.wait_for_call(Duration::from_secs(2)));
+        let calls = runner.calls();
+        assert_eq!(state_of(&calls[0]).as_deref(), Some("idle"));
+        assert!(reporter.shutdown());
+    }
+
+    #[test]
+    fn the_heartbeat_re_asserts_an_unchanged_state() {
+        // Herdr can drop the pane's authority on its own (settling process
+        // detection, a config reload, `/reload` swapping this library). Without a
+        // repeat the pane would stay invisible until the next real transition.
+        let runner = RecordingRunner::new();
+        let reporter = reporter_with_heartbeat(
+            Arc::clone(&runner),
+            Arc::new(NoContext),
+            Duration::from_millis(80),
+        );
+        reporter.submit(Input::RunStarted, None);
+        assert!(runner.wait_for_call(Duration::from_secs(2)), "first report");
+        assert!(
+            runner.wait_for_call(Duration::from_secs(2)),
+            "the beat must repeat the same state"
+        );
+        let calls = runner.calls();
+        assert_eq!(state_of(&calls[0]).as_deref(), Some("working"));
+        assert_eq!(state_of(&calls[1]).as_deref(), Some("working"));
+        // Sequence numbers still move forward, or Herdr drops the repeat.
+        assert!(calls[1].iter().any(|a| a == "--seq"));
+        assert_ne!(calls[0], calls[1]);
+        assert!(reporter.shutdown());
+    }
+
+    #[test]
+    fn the_heartbeat_reclaims_the_pane_after_a_release() {
+        // `/reload` sends `SessionShutdown` to the freshly loaded instance while
+        // the session keeps running. If the beat honoured that release the pane
+        // would stay unclaimed forever and an idle agent would vanish from
+        // Herdr's list — the bug this whole change is about.
+        let runner = RecordingRunner::new();
+        let reporter = reporter_with_heartbeat(
+            Arc::clone(&runner),
+            Arc::new(NoContext),
+            Duration::from_millis(60),
+        );
+        reporter.submit(Input::RunStarted, None);
+        assert!(runner.wait_for_call(Duration::from_secs(2)), "claim");
+        reporter.submit_release();
+        assert!(runner.wait_for_call(Duration::from_secs(2)), "release");
+        // The very next beat must claim the pane again.
+        assert!(
+            runner.wait_for_call(Duration::from_secs(2)),
+            "the beat must re-claim after a release, got {:?}",
+            runner.calls()
+        );
+        let calls = runner.calls();
+        let last = calls.last().expect("a beat");
+        assert!(
+            last.iter().any(|a| a == "--state"),
+            "the beat re-claims with a state report, got {last:?}"
+        );
+        assert!(reporter.shutdown());
+    }
+
+    #[test]
+    fn a_stopped_reporter_never_beats() {
+        // The real end of a session: `begin_shutdown` stops the reporter, so no
+        // beat may resurrect the claim after the host has moved on.
+        let runner = RecordingRunner::new();
+        let reporter = reporter_with_heartbeat(
+            Arc::clone(&runner),
+            Arc::new(NoContext),
+            Duration::from_millis(50),
+        );
+        reporter.submit(Input::RunStarted, None);
+        assert!(runner.wait_for_call(Duration::from_secs(2)));
+        assert!(reporter.shutdown());
+        let after_stop = runner.calls().len();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            runner.calls().len(),
+            after_stop,
+            "a stopped reporter must stay silent, got {:?}",
+            runner.calls()
+        );
     }
 }

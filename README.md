@@ -37,7 +37,8 @@ rpi uninstall rpi-herdr               # 卸载
 
 | rpi 事件 | 得到的状态 |
 | --- | --- |
-| `SessionStart` | 保持不变 |
+| `BeforeTuiStart` | 置为交互模式并立即 claim 窗格 |
+| `SessionStart` | 保持不变（仅记录：本实例确实收到过 start） |
 | `BeforeAgentStart`（每轮用户 prompt） | `working` |
 | `AgentStart` | `working` |
 | `AgentEnd`（完成 / 中止 / 失败） | `idle` |
@@ -46,11 +47,35 @@ rpi uninstall rpi-herdr               # 卸载
 | `SessionShutdown` | 释放窗格 |
 | 进程退出（`begin_shutdown`） | 释放窗格 |
 
-只有状态**真的变化**时才上报。交互框关闭后回到 `working` 而不是 `idle`，因为 rpi 的
-审批/`ask_user` 弹框都发生在一次 run 内部，run 尚未结束。
+只有状态**真的变化**时才上报；此外每 10 秒有一次心跳重报，用来把被外部抹掉的归属
+自愈回来（见下）。交互框关闭后回到 `working` 而不是 `idle`，因为 rpi 的审批/
+`ask_user` 弹框都发生在一次 run 内部，run 尚未结束。
 
 Herdr 可能把"一轮跑完的空闲"显示成 `done` 之类的展示态；上报的线值始终是
 `idle` / `working` / `blocked`。
+
+## 只在 TUI 模式上报
+
+headless 运行（`-p` / `--print` / `--mode json` / `--mode rpc` / `--server` /
+`--export`）**完全不 claim 也不 release**。原因：Herdr 的 agent 归属是 per
+(pane, source) 单槽，而 `release-agent` 会清空整格。旧版本让一次性运行自己 claim
+再 release，于是宿主 TUI 正在 `working` 时，模型在 `bash` 里跑一次 `rpi -p` 就会把
+父进程从列表里抹掉，直到下一次真实状态变化才回来。
+
+判定依据是**宿主自己的 argv**（`src/env.rs` 的 `is_interactive_process`）。为什么
+不能用别的信号（都是实测结论）：
+
+- `BeforeTuiStart` / `SessionStart` 只在进程启动时派发一次。`/reload` 加载的新库
+  **不会**再收到它们，用它做门控会让重载后的插件永久静默。
+- `--mode rpc` 同样派发 `SessionStart`，无法据此区分。
+- stdout 是不是 tty 不行：`rpi -p` 从 shell 启动时继承的是同一个 pty（实测
+  `isatty=true`）。
+- `GetCliFlag` 本该直接回答这个问题，但宿主在该 action 上 panic
+  （`{"error":"runtime_action panicked"}`），不可用。
+
+`rpi dev` / `dev-local` 在同一进程内跑 agent 并把真实参数放在 `--` 之后，所以对它们
+只看 `--` 之后的部分；其余情况只看第一个 `--` 之前，避免把 prompt 文本里的 `-p`
+当成 flag。
 
 ## 配置
 
@@ -98,8 +123,7 @@ Herdr 用它在服务器重启后于同一个目录重开窗格。构造规则�
 
 - 事件处理器只把最新请求写进**单槽覆盖式邮箱**然后返回（实测每个 tag 的
   `duration_ms` 都是 `0`）。处理器里不 spawn 进程、不 sleep、不持锁做 I/O。
-  唯一例外是 `-p`/`--mode json` 一次性运行结束时，为了让最终 `idle` 与释放真正
-  发出去而做的一次有界排空（每进程一次）。
+  静默路径（headless 运行）连邮箱都不碰。
 - 只有一个后台线程执行 `herdr`；一次上报还在路上时积累的多个变化只会保留最后一个。
 - 每次调用有 2 秒上限，超时即 `kill`；spawn 失败、非零退出、超时一律忽略。
 - 三个标准流全部重定向到 null（TUI 独占 tty，且 `herdr` 会往 stdout 写 JSON）。
@@ -116,8 +140,28 @@ Herdr 用它在服务器重启后于同一个目录重开窗格。构造规则�
 mkdir -p /tmp/fakebin
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$FAKE_HERDR_LOG"\n' > /tmp/fakebin/herdr
 chmod +x /tmp/fakebin/herdr
+
+# headless：必须一条调用都没有
 HERDR_ENV=1 HERDR_PANE_ID=test:pane HERDR_BIN_PATH=/tmp/fakebin/herdr \
   FAKE_HERDR_LOG=/tmp/fake.log rpi -p 'hi'
+cat /tmp/fake.log      # 期望：文件不存在或为空
+
+# TUI（需要 pty）：启动即 claim 一次，之后每 10s 一次心跳
+python3 - <<'PY'
+import os, pty, select, time
+env = dict(os.environ, HERDR_ENV="1", HERDR_PANE_ID="test:pane",
+           HERDR_BIN_PATH="/tmp/fakebin/herdr", FAKE_HERDR_LOG="/tmp/fake.log",
+           TERM="xterm-256color")
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe("rpi", ["rpi", "--no-session", "--no-tools"], env)
+end = time.time() + 25
+while time.time() < end:
+    if select.select([fd], [], [], 0.2)[0]:
+        try: os.read(fd, 65536)
+        except OSError: break
+os.kill(pid, 9)
+PY
 cat /tmp/fake.log
 
 # 真机（建议用独立命名会话，别影响日常会话）
@@ -139,18 +183,17 @@ rpi events path && rpi events tail
 
 ## 已知限制
 
-- **`-p` / `--mode json` 不派发 `SessionStart` / `SessionShutdown`**。插件据此把
-  "从未收到 `SessionStart`" 当作一次性运行：`AgentEnd` 时先让 `idle` 落地，再主动
-  释放。长会话模式仍走 `SessionShutdown`。
 - **`blocked` 在 v1 只在 TUI 选择器路径上可见**。宿主目前只在
   `open_selector_with_view` / `close_selector` 派发 `UiPromptStart` / `UiPromptEnd`；
   扩展输入框、`ask_user` 的打开/提交路径不派发，所以那种等待仍显示 `working`。
   这是核心侧行为，插件无法补齐。
+- **`/reload` 之后宿主仍会给新库派发一次 `SessionShutdown`**，尽管会话并没有结束。
+  插件用"本实例从未收到 `SessionStart`"识别这种假释放并跳过它，否则正在 `working`
+  的 agent 会被从列表里抹掉。代价：真正的退出路径没有 `SessionStart` 时不会主动
+  释放（进程退出后 Herdr 会在 1–2 秒内自己清理窗格）。
 - **`release-agent` 会清空整个窗格的 agent 归属**，不按 `--source` 区分（实测）。
-  因此同一窗格里若有别的进程用同一个 pane id 上报，会互相覆盖。嵌套的 `rpi`
-  子进程会继承 `HERDR_*`（等着色工具的 `bash` 子 shell 也一样），这也是宿主
-  `HOST_PRIVATE_ENV` 尚未包含 `HERDR_*` 的结果：在模型调用的 `bash` 里运行 `rpi`
-  会与宿主 agent 抢同一个窗格。
+  同一窗格里若有别的进程用同一个 pane id 上报，仍会互相覆盖——但 headless 运行现在
+  什么都不发，所以最常见的那条路径（模型在 `bash` 里跑 `rpi -p`）已经不会再抢窗格。
 - 释放失败不影响正确性：进程退出后窗格回到 shell 提示符，Herdr 会在 1–2 秒内自己
   清理。插件侧的释放只是让这个清理立刻发生。
 - 恢复需要 Herdr ≥ 0.9.2；更旧的版本会忽略恢复命令，状态上报与释放照常工作。

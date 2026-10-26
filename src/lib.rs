@@ -14,6 +14,7 @@
 //!
 //! | Event | Input | Result |
 //! | --- | --- | --- |
+//! | `BeforeTuiStart` | — | interactive mode, claim the pane |
 //! | `SessionStart` | `SessionReady` | unchanged |
 //! | `BeforeAgentStart` | `PromptStarted` | `working` |
 //! | `AgentStart` | `RunStarted` | `working` |
@@ -22,11 +23,18 @@
 //! | `UiPromptEnd` | `PromptDismissed` | `working` |
 //! | `SessionShutdown` | — | release |
 //!
+//! Only an interactive TUI reports at all. A headless run (`-p`, `--mode json`,
+//! `--mode rpc`, `--server`, `--export`) neither claims nor releases, because
+//! Herdr's ownership is a single per-(pane, source) slot: a one-shot child
+//! releasing it would blank a parent TUI that is still working. The mode is read
+//! from the host's argv ([`env::is_interactive_process`]) — see that function for
+//! why no event can answer this after a `/reload`.
+//!
 //! Handlers never spawn a process and never touch the network: they overwrite a
 //! one-slot mailbox and return, and a single background thread performs the
-//! `herdr` call with a short deadline. The one exception is the drain before a
-//! final `idle`+release on the one-shot path, which is bounded and happens once
-//! per process.
+//! `herdr` call with a short deadline. A heartbeat re-reports the current state
+//! every [`reporter::HEARTBEAT_INTERVAL`] so a claim lost to an external release
+//! heals by itself.
 //!
 //! ## Configuration
 //!
@@ -52,9 +60,7 @@ use rpi_plugin_sdk::{
     EventTag, PluginApi, RuntimeActionId, StbString, StbStringRef, EVENT_HANDLER_CONTINUE,
 };
 
-use crate::reporter::{
-    ContextSource, ProcessRunner, Reporter, REPORT_FLUSH_TIMEOUT, SHUTDOWN_FLUSH_TIMEOUT,
-};
+use crate::reporter::{ContextSource, ProcessRunner, Reporter, SHUTDOWN_FLUSH_TIMEOUT};
 use crate::resume::ExecContext;
 use crate::state::Input;
 
@@ -142,7 +148,15 @@ rpi_plugin_sdk::event_handler! {
             return EVENT_HANDLER_CONTINUE;
         };
         match event.tag() {
-            EventTag::SessionStart => reporter.submit(Input::SessionReady, None),
+            // A second, earlier claim. Start-up already consults the host's argv
+            // (see `env::is_interactive_process`), and this event is the one
+            // signal that `/reload` does *not* re-dispatch — so it can only add
+            // an extra claim, never stand in for the argv check.
+            EventTag::BeforeTuiStart => reporter.enter_interactive(),
+            EventTag::SessionStart => {
+                reporter.note_session_start();
+                reporter.submit(Input::SessionReady, None);
+            }
             EventTag::BeforeAgentStart => {
                 // `{"prompt","imageCount","systemPrompt","sessionId","host"}`.
                 // Only `sessionId` matters here. Deserialise into a two-field
@@ -166,20 +180,6 @@ rpi_plugin_sdk::event_handler! {
             EventTag::AgentStart => reporter.submit(Input::RunStarted, None),
             EventTag::AgentEnd => {
                 reporter.submit(Input::RunEnded, None);
-                // `-p` and `--mode json` dispatch neither `SessionStart` nor
-                // `SessionShutdown`, and the host's own cleanup thread does not
-                // outlive the process. Release here so the pane is not left
-                // showing a dead agent (Herdr's own fallback is also slower).
-                if reporter.is_one_shot_run() {
-                    // Let the `idle` report land first: publishing the release
-                    // into the same slot would overwrite it, and the final
-                    // state is what a user watching the sidebar expects to see.
-                    // The intermediate drain is short by design; the long budget
-                    // is reserved for the release below.
-                    reporter.flush(REPORT_FLUSH_TIMEOUT);
-                    reporter.submit_release();
-                    reporter.flush(SHUTDOWN_FLUSH_TIMEOUT);
-                }
             }
             // The host dispatches these two as *empty* events, so the payload
             // accessors must not be touched here (`EventView::data_text` lists
@@ -241,7 +241,8 @@ extern "C" fn finish_shutdown(_user_data: *mut c_void) -> i32 {
 
 /// Event tags this plugin observes. Deliberately small: an integration that
 /// needs no model interaction should not add per-turn FFI work.
-const TAGS: [EventTag; 7] = [
+const TAGS: [EventTag; 8] = [
+    EventTag::BeforeTuiStart,
     EventTag::SessionStart,
     EventTag::SessionShutdown,
     EventTag::BeforeAgentStart,
@@ -294,7 +295,7 @@ rpi_plugin_sdk::export_plugin!(|api: &PluginApi| {
     };
 
     let runner = Arc::new(ProcessRunner::new(env.bin_path.clone()));
-    let reporter = Reporter::start(env, runner, context);
+    let reporter = Reporter::start_in_current_mode(env, runner, context);
 
     // Publish the reporter *before* the handlers exist. The lifecycle hook is
     // already registered, so every later failure path leaves the host with a
@@ -346,8 +347,9 @@ mod tests {
     fn the_observed_tags_are_the_ones_the_state_machine_needs() {
         // Guards against an accidental edit that would silently drop a
         // transition (for example losing `AgentEnd` and never returning to idle).
-        assert_eq!(TAGS.len(), 7);
+        assert_eq!(TAGS.len(), 8);
         for required in [
+            EventTag::BeforeTuiStart,
             EventTag::SessionStart,
             EventTag::SessionShutdown,
             EventTag::BeforeAgentStart,
@@ -453,6 +455,7 @@ mod tests {
             resume_enabled: true,
         };
         let reporter = Reporter::start(env, Arc::new(Wedged), Arc::new(Wedged));
+        reporter.mark_interactive_silently();
         reporter.submit(Input::RunStarted, None);
         // Give the worker time to pick the request up and enter `run`.
         std::thread::sleep(std::time::Duration::from_millis(150));
